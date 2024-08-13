@@ -1,0 +1,356 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "diag/trace.h"
+
+/* Kernel includes. */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "timers.h"
+#include "semphr.h"
+#define CCM_RAM __attribute__((section(".ccmram")))
+
+
+/*-------------------------system parameters---------------------------*/
+/* Constants */
+#define QUEUE_SIZE 10  // Queue size
+#define RECEIVER_PERIOD_MS 100  // Receiver period in milliseconds
+#define RESET_COUNT 1000  // Number of messages before reset
+
+/* Timer period bounds */
+static const uint32_t lower[] = {50, 80, 110, 140, 170, 200};  // Lower bounds for random periods
+static const uint32_t upper[] = {150, 200, 250, 300, 350, 400};  // Upper bounds for random periods
+
+/* Handlers */
+QueueHandle_t testQueue;  // Queue handle
+SemaphoreHandle_t sender_semaphore[3];  // Sender semaphores
+SemaphoreHandle_t receiver_semaphore;  // Receiver semaphore
+TimerHandle_t sender_timer[3];  // Sender timers
+TimerHandle_t receiver_timer;  // Receiver timer
+
+/* Counters struct */
+struct counter {
+    uint32_t sent[3];  // Sent message counts for each sender
+    uint32_t blocked[3];  // Blocked message counts for each sender
+    uint32_t received;  // Received message count
+    uint8_t current_i;  // Current index for period bounds
+    uint32_t periods[3];  // Periods of each sender
+    uint32_t total_period;  // Total period sum for average calculation
+    uint32_t count_period;  // Count of periods considered for average
+    uint32_t count_period_task[3]; //counter of periods per task
+} counters = { {0}, {0}, 0, 0, {0}, 0, 0, {0} };  // Initialize all values to 0
+
+
+/*---------------function declarations -------------*/
+void initializeSystem();
+uint32_t getRan (int i);
+void printCounters();
+void resetCounters();
+void senderTimerCallback(TimerHandle_t xTimer);
+void receiverTimerCallback(TimerHandle_t xTimer);
+void sender_task(void *parameters);
+void receiver_task(void *parameters);
+void firstReset();
+void resetSystem();
+void Game_over();
+
+/*---------------------------------------main function------------------------------------*/
+int main(void) {
+    trace_printf("Reset system...\n");
+    initializeSystem();// create queue & semaphores
+    firstReset(); // Call firstReset at the beginning
+
+    // Create sender tasks
+    for (int i = 0; i < 3; i++) {
+        BaseType_t result = xTaskCreate(sender_task, "Sender", 1000, (void*)i, (i == 2) ? 2 : 1, NULL);
+        if (result != pdPASS) {
+            return 0;
+        }}
+    // Create receiver task
+    BaseType_t result = xTaskCreate(receiver_task, "Receiver", 1000, NULL, 3, NULL);
+    // Create and start receiver timer
+    receiver_timer = xTimerCreate("Receiver Timer", pdMS_TO_TICKS(RECEIVER_PERIOD_MS), pdTRUE, NULL, receiverTimerCallback);
+    xTimerStart(receiver_timer, 0);
+    vTaskStartScheduler();
+    return 0;
+}
+
+
+
+/*-------------------------system layout---------------------------*/
+/*the function setup the program and intializes the tasks,queue, semaphore */
+void initializeSystem() {
+    // Create queue
+    testQueue = xQueueCreate(QUEUE_SIZE, sizeof(char[20]));
+    if (testQueue == NULL) {
+        return;
+    }
+    // Create semaphores
+    for (int i = 0; i < 3; ++i) {
+        sender_semaphore[i] = xSemaphoreCreateBinary();
+    }
+    receiver_semaphore = xSemaphoreCreateBinary();
+}
+
+
+
+uint32_t getRan (int i) {
+    // Get a random period between lower and upper bounds
+    uint32_t low = lower[i];
+    uint32_t up = upper[i];
+    return low + (rand() % (up - low + 1)); // using uniform distribution
+}
+uint32_t newRandom(uint8_t i){
+
+    uint32_t period = getRan(counters.current_i);
+    //counters.periods[i] = period; // Store the period
+    counters.total_period += period; // Add period to total sum
+    counters.count_period++;
+    counters.count_period_task[i]++;
+    counters.periods[i] += period; //Update period
+    return period;
+}
+
+/*--printing counters just before closing the program or incrementing the upper and lower boundaries--*/
+
+void printCounters() {
+    // Print all counters
+    trace_printf("Total Sent Messages: %lu\n", counters.sent[0] + counters.sent[1] + counters.sent[2]+counters.blocked[0] + counters.blocked[1] + counters.blocked[2]);
+    trace_printf("Total Successfully Sent Messages: %lu\n", counters.sent[0] + counters.sent[1] + counters.sent[2]);
+    trace_printf("Total Blocked Messages: %lu\n", counters.blocked[0] + counters.blocked[1] + counters.blocked[2]);
+    trace_printf("Sender 0 Sent Messages: %lu\n", counters.sent[0] + counters.blocked[0]);
+    trace_printf("Sender 1 Sent Messages: %lu\n", counters.sent[1] + counters.blocked[1]);
+    trace_printf("Sender 2 Sent Messages: %lu\n", counters.sent[2] + counters.blocked[2]);
+    trace_printf("Sender 0 successfully Sent Messages: %lu\n", counters.sent[0] );
+    trace_printf("Sender 1 successfully Sent Messages: %lu\n", counters.sent[1]);
+    trace_printf("Sender 2 successfully Sent Messages: %lu\n", counters.sent[2]);
+    trace_printf("Sender 0 Blocked Messages: %lu\n", counters.blocked[0]);
+    trace_printf("Sender 1 Blocked Messages: %lu\n", counters.blocked[1]);
+    trace_printf("Sender 2 Blocked Messages: %lu\n", counters.blocked[2]);
+    trace_printf("Total Received Messages: %lu\n", counters.received);
+    uint32_t average = counters.total_period / counters.count_period;
+    uint32_t average_task1 = counters.periods[0] / counters.count_period_task[0];
+    uint32_t average_task2 = counters.periods[1] / counters.count_period_task[1];
+    uint32_t average_task3 = counters.periods[2] / counters.count_period_task[2];
+    trace_printf("Average Sender Time: %lu ms\n", average);
+    trace_printf("Average Sender task1 Time: %lu ms\n", average_task1);
+    trace_printf("Average Sender task2 Time: %lu ms\n", average_task2);
+    trace_printf("Average Sender task3 Time: %lu ms\n", average_task3);
+
+}
+
+void resetCounters(){
+	  counters.sent[0]=0;  // Sent message counts for each sender
+	  counters.sent[1]=0;
+	  counters.sent[2]=0;
+	  counters.blocked[0]=0;  // Blocked message counts for each sender
+	  counters.blocked[1]=0;
+	  counters.blocked[2]=0;
+	  counters.received=0;  // Received message count
+	  counters.current_i=0;
+	  counters.periods[0]=0;  // Periods of each sender
+	  counters.periods[1]=0;
+	  counters.periods[2]=0;
+	  counters.total_period=0;  // Total period sum for average calculation
+	  counters.count_period=0;  // Count of periods considered for average
+	  counters.count_period_task[0]=0; //counter of periods per task
+	  counters.count_period_task[1]=0;
+	  counters.count_period_task[2]=0;
+}
+
+/*--------------------creating the callback functions for receiver and sender ------------------*/
+void senderTimerCallback(TimerHandle_t xTimer) {
+    int i = (int)pvTimerGetTimerID(xTimer);
+    xSemaphoreGive(sender_semaphore[i]);  // Give semaphore to sender
+    // Reset the timer with a new random period
+    xTimerChangePeriod(xTimer, pdMS_TO_TICKS(newRandom(i)), 0);
+}
+void receiverTimerCallback(TimerHandle_t xTimer) {
+    xSemaphoreGive(receiver_semaphore);  // Give semaphore to receiver
+    (void)xTimer; // To avoid unused parameter warning
+}
+
+
+
+
+
+
+/*--------------------creating the task functions for receiver and sender ------------------*/
+void sender_task(void *parameters) {
+    int i = (int)parameters;
+    char message[20];
+    BaseType_t xStatus;
+
+    while (1) {
+        // Wait for the semaphore
+        if (xSemaphoreTake(sender_semaphore[i], portMAX_DELAY) == pdTRUE) {
+            snprintf(message, sizeof(message), "Time is %lu", xTaskGetTickCount());
+
+            // Successfully received
+          trace_printf("Time is %lu\n", xTaskGetTickCount());
+
+            // Try to send the message to the queue
+            xStatus = xQueueSend(testQueue, &message, 0);
+            if (xStatus != pdPASS) {
+                // Failed to send
+                counters.blocked[i]++;
+            } else {
+                // Successfully sent
+                counters.sent[i]++;
+            }
+        }
+    }
+}
+
+void receiver_task(void *parameters) {
+    char received[20];
+    BaseType_t xStatus;
+    while (1) {
+        // Wait for the semaphore
+        if (xSemaphoreTake(receiver_semaphore, portMAX_DELAY) == pdTRUE) {
+            xStatus = xQueueReceive(testQueue, &received, 0);
+            if (xStatus == pdPASS) {
+
+                counters.received++;
+            } else {
+                // Failed to receive
+            }
+
+            if (counters.received >= RESET_COUNT) {
+                    resetSystem();
+            }
+        }
+    }
+    (void)parameters; // Avoid unused parameter warning
+}
+
+
+
+/*---reseting the system after printing the counters so it will update the program and start with a new period interval---*/
+void firstReset() {
+    // Reset counters
+    resetCounters();
+//printCounters();
+    // Clear queue
+    xQueueReset(testQueue);
+
+    // Configure sender timers with initial random periods
+    for (int i = 0; i < 3; i++) {
+        sender_timer[i] = xTimerCreate("Sender timer", pdMS_TO_TICKS(newRandom(i)), pdTRUE, (void*)i, senderTimerCallback);
+
+        xTimerStart(sender_timer[i], 0);
+    }
+}
+
+void resetSystem() {
+	if (counters.current_i >= 5) {
+	    trace_printf("Game Over\n");
+	    printCounters();
+	    Game_over(); // End the program
+	}
+	else {
+		// Print counters
+		    printCounters();
+		    uint32_t temp = counters.current_i;
+		    // Reset counters
+		   resetCounters();
+		    // Clear queue
+		    xQueueReset(testQueue);
+		    // Switch current.index to the next one if not the first reset
+		    counters.current_i = temp + 1;
+		    // Configure sender timers with new random periods
+		    for (int i = 0; i < 3; i++) {
+
+		        xTimerChangePeriod(sender_timer[i], pdMS_TO_TICKS(newRandom(i)), 0);
+		        xTimerStart(sender_timer[i], 0);
+		    }
+		    trace_printf("System reset!\n");
+	}
+}
+void Game_over(){
+	xTimerStop(sender_timer[0],0);
+	 xTimerStop(sender_timer[1],0);
+	 xTimerStop(sender_timer[2],0);
+	 xTimerStop(receiver_timer,0);
+	 xTimerDelete(sender_timer[0],0);
+	 xTimerDelete(sender_timer[1],0);
+	 xTimerDelete(sender_timer[2],0);
+	 xTimerDelete(receiver_timer,0);
+	 vQueueDelete(testQueue);
+	 vSemaphoreDelete(sender_semaphore[0]);
+	 vSemaphoreDelete(sender_semaphore[1]);
+	 vSemaphoreDelete(sender_semaphore[2]);
+	 vSemaphoreDelete(receiver_semaphore);
+	 exit(0);
+}
+
+
+
+
+
+
+
+
+
+
+// ----------------------------------------------------------------------------
+
+void vApplicationMallocFailedHook(void) {
+    /* Called if a call to pvPortMalloc() fails because there is insufficient
+    free memory available in the FreeRTOS heap.  pvPortMalloc() is called
+    internally by FreeRTOS API functions that create tasks, queues, software
+    timers, and semaphores.  The size of the FreeRTOS heap is set by the
+    configTOTAL_HEAP_SIZE configuration constant in FreeRTOSConfig.h. */
+    for(;;);
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t pxTask, char *pcTaskName) {
+    (void) pcTaskName;
+    (void) pxTask;
+
+    /* Run time stack overflow checking is performed if
+    configCHECK_FOR_STACK_OVERFLOW is defined to 1 or 2.  This hook
+    function is called if a stack overflow is detected. */
+    for(;;);
+}
+
+void vApplicationIdleHook(void) {
+    volatile size_t xFreeStackSpace;
+
+    /* This function is called on each cycle of the idle task.  In this case it
+    does nothing useful, other than report the amount of FreeRTOS heap that
+    remains unallocated. */
+    xFreeStackSpace = xPortGetFreeHeapSize();
+
+    if (xFreeStackSpace > 100) {
+        /* By now, the kernel has allocated everything it is going to, so
+        if there is a lot of heap remaining unallocated then
+        the value of configTOTAL_HEAP_SIZE in FreeRTOSConfig.h can be
+        reduced accordingly. */
+    }
+}
+
+void vApplicationTickHook(void) {
+}
+
+StaticTask_t xIdleTaskTCB CCM_RAM;
+StackType_t uxIdleTaskStack[configMINIMAL_STACK_SIZE] CCM_RAM;
+
+void vApplicationGetIdleTaskMemory(StaticTask_t **ppxIdleTaskTCBBuffer, StackType_t **ppxIdleTaskStackBuffer, uint32_t *pulIdleTaskStackSize) {
+    *ppxIdleTaskTCBBuffer = &xIdleTaskTCB;
+    *ppxIdleTaskStackBuffer = uxIdleTaskStack;
+    *pulIdleTaskStackSize = configMINIMAL_STACK_SIZE;
+}
+
+static StaticTask_t xTimerTaskTCB CCM_RAM;
+static StackType_t uxTimerTaskStack[configTIMER_TASK_STACK_DEPTH] CCM_RAM;
+
+void vApplicationGetTimerTaskMemory(StaticTask_t **ppxTimerTaskTCBBuffer, StackType_t **ppxTimerTaskStackBuffer, uint32_t *pulTimerTaskStackSize) {
+    *ppxTimerTaskTCBBuffer = &xTimerTaskTCB;
+    *ppxTimerTaskStackBuffer = uxTimerTaskStack;
+    *pulTimerTaskStackSize = configTIMER_TASK_STACK_DEPTH;
+}
+
+
+
